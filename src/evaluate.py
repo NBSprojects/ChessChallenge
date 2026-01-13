@@ -131,6 +131,102 @@ class ChessEvaluator:
         
         return " ".join(moves)
     
+    def _is_separator_token(self, token_str: str) -> bool:
+        """
+        Check if a token represents a separator (whitespace, EOS, etc.).
+        
+        This allows the evaluator to work with different tokenization strategies:
+        - Move-level tokenizers: each move is one token, no separators generated
+        - Character-level tokenizers: space character marks end of move
+        - BPE/subword tokenizers: may generate partial moves
+        
+        Args:
+            token_str: The decoded token string.
+        
+        Returns:
+            True if this token indicates end of a move.
+        """
+        # Check for EOS token
+        if hasattr(self.tokenizer, 'eos_token') and token_str == self.tokenizer.eos_token:
+            return True
+        
+        # Check for whitespace (space, newline, etc.)
+        if token_str.strip() == "" and len(token_str) > 0:
+            return True
+        
+        # Check if the token ends with whitespace (some tokenizers include trailing space)
+        if token_str != token_str.rstrip():
+            return True
+        
+        return False
+
+    def _generate_move_tokens(
+        self,
+        input_ids: torch.Tensor,
+        temperature: float = 0.7,
+        top_k: int = 10,
+        max_tokens: int = 20,
+    ) -> str:
+        """
+        Generate tokens until a separator (whitespace/EOS) is encountered.
+        
+        This method supports different tokenization strategies:
+        - For move-level tokenizers: generates one token (the full move)
+        - For character/subword tokenizers: generates until whitespace
+        
+        Args:
+            input_ids: The input token IDs.
+            temperature: Sampling temperature.
+            top_k: Top-k filtering parameter.
+            max_tokens: Maximum tokens to generate for a single move.
+        
+        Returns:
+            The generated move string (without trailing separator).
+        """
+        generated_tokens = []
+        current_ids = input_ids.clone()
+        
+        for _ in range(max_tokens):
+            with torch.no_grad():
+                outputs = self.model(input_ids=current_ids)
+                logits = outputs.logits[:, -1, :] / temperature
+                
+                # Apply top-k filtering
+                if top_k > 0:
+                    top_k_values = torch.topk(logits, min(top_k, logits.size(-1)))[0]
+                    indices_to_remove = logits < top_k_values[..., -1, None]
+                    logits[indices_to_remove] = float("-inf")
+                
+                # Sample
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # Shape: [1, 1]
+            
+            # Decode the token
+            token_str = self.tokenizer.decode(next_token[0])
+            
+            # Check if this is a separator token
+            if self._is_separator_token(token_str):
+                break
+            
+            generated_tokens.append(next_token[0])  # Store [1] tensor
+            
+            # Append to input for next iteration (next_token is already [1, 1])
+            current_ids = torch.cat([current_ids, next_token], dim=-1)
+            
+            # For move-level tokenizers, a single non-separator token is the full move
+            # We can detect this by checking if the token looks like a complete move
+            # (starts with W or B, has enough characters for a move)
+            if len(token_str) >= 6 and token_str[0] in "WB":
+                break
+        
+        # Decode all generated tokens together
+        if generated_tokens:
+            all_tokens = torch.cat(generated_tokens, dim=0)
+            move_str = self.tokenizer.decode(all_tokens, skip_special_tokens=True)
+            return move_str.strip()
+        
+        return ""
+
     def _get_model_move(
         self,
         board,
@@ -139,6 +235,12 @@ class ChessEvaluator:
     ) -> Tuple[Optional[str], int]:
         """
         Get the model's next move prediction.
+        
+        This method generates tokens until a separator (whitespace/EOS) is produced,
+        allowing it to work with different tokenization strategies:
+        - Move-level tokenizers: each move is a single token
+        - Character-level tokenizers: moves are generated character by character
+        - BPE/subword tokenizers: moves may be split into subwords
         
         Returns:
             Tuple of (UCI move string, number of retries used).
@@ -159,26 +261,17 @@ class ChessEvaluator:
             input_text,
             return_tensors="pt",
             truncation=True,
-            max_length=self.model.config.n_ctx - 1,
+            max_length=self.model.config.n_ctx - 10,  # Leave room for generated tokens
         ).to(self.device)
         
         # Try to generate a legal move
         for retry in range(self.max_retries):
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                logits = outputs.logits[:, -1, :] / temperature
-                
-                # Apply top-k filtering
-                if top_k > 0:
-                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-                    logits[indices_to_remove] = float("-inf")
-                
-                # Sample
-                probs = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            
-            # Decode the move
-            move_token = self.tokenizer.decode(next_token[0])
+            # Generate tokens until separator
+            move_token = self._generate_move_tokens(
+                inputs["input_ids"],
+                temperature=temperature,
+                top_k=top_k,
+            )
             
             # Convert to UCI
             if len(move_token) >= 6:
@@ -195,9 +288,6 @@ class ChessEvaluator:
                         return uci_move, retry
                 except (ValueError, self.chess.InvalidMoveError):
                     pass
-            
-            # Mask out the tried token for next retry
-            logits[0, next_token[0]] = float("-inf")
         
         return None, self.max_retries
     
