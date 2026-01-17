@@ -217,7 +217,13 @@ def main():
         seed=args.seed,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         report_to=["none"],
+        torch_compile=True,
+        torch_compile_backend="inductor",  
+        torch_compile_mode="default", 
     )
+
+    # avant torch compile : 45it/s
+    # après : 77 it/s
     
     # Create trainer
     trainer = Trainer(
