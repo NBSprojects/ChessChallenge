@@ -125,6 +125,7 @@ class ChessDataCollator:
         }
 
 
+
 def create_train_val_datasets(
     tokenizer,
     dataset_name: str = "dlouapre/lichess_2025-01_1M",
@@ -132,56 +133,45 @@ def create_train_val_datasets(
     train_samples: Optional[int] = None,
     val_samples: int = 5000,
     val_ratio: float = 0.05,
+    num_proc: int = 8,
 ):
-    """
-    Create training and validation datasets.
-    
-    Args:
-        tokenizer: The chess tokenizer.
-        dataset_name: Name of the dataset.
-        max_length: Maximum sequence length.
-        train_samples: Maximum training samples (None for all).
-        val_samples: Number of validation samples.
-        val_ratio: Ratio of validation samples (used if train_samples is None).
-    
-    Returns:
-        Tuple of (train_dataset, val_dataset).
-    """
     from datasets import load_dataset
     
-    # Load full dataset
     full_dataset = load_dataset(dataset_name, split="train")
     
-    # Determine split sizes
-    total = len(full_dataset)
+    def tokenize_function(examples):
+        texts = [tokenizer.bos_token + " " + game for game in examples["text"]]
+        encodings = tokenizer(
+            texts,
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+            return_tensors=None,
+        )
+        encodings["labels"] = [
+            [-100 if m == 0 else i for i, m in zip(ids, mask)]
+            for ids, mask in zip(encodings["input_ids"], encodings["attention_mask"])
+        ]
+        return encodings
     
-    if train_samples is not None:
-        n_train = min(train_samples, total - val_samples)
-    else:
-        n_train = int(total * (1 - val_ratio))
-    
-    n_val = min(val_samples, total - n_train)
-    
-    # Split dataset
-    train_data = full_dataset.select(range(n_train))
-    val_data = full_dataset.select(range(n_train, n_train + n_val))
-    
-    # Create dataset objects
-    train_dataset = ChessDataset(
-        tokenizer=tokenizer,
-        dataset_name=dataset_name,
-        max_length=max_length,
+    # KEY CHANGE: Disable caching entirely
+    tokenized = full_dataset.map(
+        tokenize_function,
+        batched=True,
+        batch_size=1000,
+        num_proc=num_proc,
+        remove_columns=full_dataset.column_names,
+        desc="Tokenizing",
+        load_from_cache_file=False,  # Don't load from cache
+        keep_in_memory=True,          # Keep in RAM, don't write to disk
     )
-    train_dataset.data = train_data
+    tokenized.set_format(type="torch")
     
-    val_dataset = ChessDataset(
-        tokenizer=tokenizer,
-        dataset_name=dataset_name,
-        max_length=max_length,
-    )
-    val_dataset.data = val_data
+    # Split
+    n_train = min(train_samples, len(tokenized) - val_samples) if train_samples else int(len(tokenized) * (1 - val_ratio))
+    n_val = min(val_samples, len(tokenized) - n_train)
     
-    return train_dataset, val_dataset
+    return tokenized.select(range(n_train)), tokenized.select(range(n_train, n_train + n_val))
 
 
 def stream_games(

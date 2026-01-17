@@ -288,6 +288,12 @@ class MultiHeadAttention(nn.Module):
             persistent=False,
         )
 
+        self._use_flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if self._use_flash:
+            # Enable Flash Attention backend preference
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+
     def forward(
         self,
         x: torch.Tensor,

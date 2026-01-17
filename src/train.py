@@ -234,6 +234,16 @@ def main():
         seed=args.seed,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         report_to=["none"],
+
+        # Data loading speedups
+        dataloader_num_workers=4,           # Parallel data loading (adjust to CPU cores)
+        dataloader_pin_memory=True,         # Faster GPU transfer
+        dataloader_prefetch_factor=2,       # Prefetch next batches
+        dataloader_persistent_workers=True, # Keep workers alive between epochs
+        
+        # Optimizer speedup
+        optim="adamw_torch_fused",          # Fused CUDA optimizer (much faster!)
+
         torch_compile=True,
         torch_compile_backend="inductor",  
         torch_compile_mode="default", 
