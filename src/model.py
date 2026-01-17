@@ -1,8 +1,10 @@
 """
 Chess Transformer Model for the Chess Challenge.
 
-This module provides a simple GPT-style transformer architecture
-designed to fit within the 1M parameter constraint.
+Modifications:
+- RoPE positional encoding controlled by config.use_rope (default: True)
+- Optional one-hot embeddings controlled by config.one_hot_embeds (default: False)
+- GPU/torch.compile-friendly attention via torch.nn.functional.scaled_dot_product_attention (SDPA)
 
 Key components:
 - ChessConfig: Configuration class for model hyperparameters
@@ -11,8 +13,6 @@ Key components:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -25,31 +25,16 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 class ChessConfig(PretrainedConfig):
     """
     Configuration class for the Chess Transformer model.
-    
-    This configuration is designed for a ~1M parameter model.
-    Students can adjust these values to explore different architectures.
-    
-    Parameter budget breakdown (with default values):
-    - Embeddings (vocab): 1200 x 128 = 153,600
-    - Position Embeddings: 256 x 128 = 32,768
-    - Transformer Layers: 6 x ~120,000 = ~720,000
-    - LM Head (with weight tying): 0 (shared with embeddings)
-    - Total: ~906,000 parameters
-    
-    Attributes:
-        vocab_size: Size of the vocabulary (number of unique moves).
-        n_embd: Embedding dimension (d_model).
-        n_layer: Number of transformer layers.
-        n_head: Number of attention heads.
-        n_ctx: Maximum sequence length (context window).
-        n_inner: Feed-forward inner dimension (default: 3 * n_embd).
-        dropout: Dropout probability.
-        layer_norm_epsilon: Epsilon for layer normalization.
-        tie_weights: Whether to tie embedding and output weights.
+
+    New attributes:
+        use_rope: If True, use Rotary Positional Embeddings (RoPE) instead of learned absolute positions.
+        rope_theta: Base (theta) for RoPE frequencies (default: 10000.0).
+        one_hot_embeds: If True, compute token embeddings via one-hot -> matmul with embedding matrix.
+                        (More expensive; intended for experiments.)
     """
-    
+
     model_type = "chess_transformer"
-    
+
     def __init__(
         self,
         vocab_size: int = 1200,
@@ -61,6 +46,11 @@ class ChessConfig(PretrainedConfig):
         dropout: float = 0.1,
         layer_norm_epsilon: float = 1e-5,
         tie_weights: bool = True,
+        # NEW:
+        use_rope: bool = True,
+        rope_theta: float = 10000.0,
+        one_hot_embeds: bool = False,
+        # Tokens:
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -72,113 +62,295 @@ class ChessConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             **kwargs,
         )
-        
+
         self.vocab_size = vocab_size
-        self.n_embd = n_embd
+
+        self.one_hot_embeds = bool(one_hot_embeds)
+        d_model = self.vocab_size if self.one_hot_embeds else n_embd
+
+        self.n_embd = d_model
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_ctx = n_ctx
-        self.n_inner = n_inner if n_inner is not None else 3 * n_embd  # Reduced from 4x to 3x
+        self.n_inner = n_inner if n_inner is not None else 3 * n_embd  # keep your budget choice
         self.dropout = dropout
         self.layer_norm_epsilon = layer_norm_epsilon
-        self.tie_weights = tie_weights
+
+        self.tie_weights = bool(tie_weights) and (not self.one_hot_embeds)
+        self.tie_word_embeddings = bool(self.tie_weights)
+
+
+        self.use_rope = bool(use_rope)
+        self.rope_theta = float(rope_theta)
+        self.one_hot_embeds = bool(one_hot_embeds)
+
         # Inform HF base class about tying behavior
         self.tie_word_embeddings = bool(tie_weights)
+
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head}). "
+                f"(If one_hot_embeds=True, n_embd=vocab_size={self.vocab_size})"
+            )
+
+        head_dim = self.n_embd // self.n_head
+        if self.use_rope and (head_dim % 2 != 0):
+            raise ValueError(
+                f"RoPE requires even head_dim, got head_dim={head_dim}. "
+                f"Choose n_head such that (n_embd/n_head) is even."
+            )
+
+
+
+class OneHotEmbedding(nn.Module):
+    """
+    True one-hot embedding:
+    token i -> e_i in R^V (V = vocab_size)
+
+    - No parameters
+    - No embedding matrix
+    - Returns a dense (B, L, V) tensor (this is inherently expensive)
+    """
+
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+
+    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        # Pick a dtype that matches autocast (saves memory in bf16/fp16)
+        if torch.is_autocast_enabled():
+            if input_ids.is_cuda:
+                dtype = torch.get_autocast_gpu_dtype()
+            else:
+                dtype = torch.get_autocast_cpu_dtype()
+        else:
+            dtype = torch.float32
+
+        # Allocate the dense one-hot tensor directly in compute dtype
+        # Shape: (B, L, V)
+        out = torch.zeros(
+            (*input_ids.shape, self.vocab_size),
+            device=input_ids.device,
+            dtype=dtype,
+        )
+        out.scatter_(-1, input_ids.unsqueeze(-1), 1.0)
+        return out
+
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+    
+    Simpler and faster than LayerNorm - used in LLaMA, Mistral, etc.
+    Does not center (no mean subtraction), only scales by RMS.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, D)
+        # Compute RMS: sqrt(mean(x^2))
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        # Normalize and scale
+        return x / rms * self.weight
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Positional Embedding (RoPE) with precomputed sin/cos cache.
+
+    Cache is created up to max_position_embeddings and stored as buffers (not in state_dict).
+    Applies RoPE to Q and K in (B, H, L, D) format.
+    """
+
+    def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even dim, got dim={dim}")
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+
+        # inv_freq: (dim/2,)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Precompute cos/sin: (max_pos, dim/2)
+        t = torch.arange(max_position_embeddings, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    @staticmethod
+    def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, L, D)
+        # cos/sin: broadcastable to (B or 1, 1, L, D/2)
+        x1 = x[..., ::2]  # (B,H,L,D/2)
+        x2 = x[..., 1::2]  # (B,H,L,D/2)
+
+        # Apply rotation
+        # [x1; x2] -> [x1*cos - x2*sin ; x1*sin + x2*cos]
+        y1 = x1 * cos - x2 * sin
+        y2 = x1 * sin + x2 * cos
+
+        # Interleave back to (B,H,L,D)
+        return torch.stack((y1, y2), dim=-1).flatten(-2)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # q,k: (B, H, L, D)
+        B, H, L, D = q.shape
+
+        if position_ids is None:
+            # Fast path: positions [0..L-1], same for whole batch
+            if L > self.cos_cached.size(0):
+                raise ValueError(
+                    f"Sequence length {L} exceeds RoPE cache size {self.cos_cached.size(0)}. "
+                    f"Increase n_ctx/max_position_embeddings."
+                )
+            cos = self.cos_cached[:L].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)  # (1,1,L,D/2)
+            sin = self.sin_cached[:L].to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
+        else:
+            # position_ids: (B, L) (or (L,))
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0).expand(B, -1)
+
+            flat = position_ids.reshape(-1)  # (B*L,)
+            cos = (
+                self.cos_cached.index_select(0, flat)
+                .reshape(B, L, -1)
+                .to(dtype=q.dtype)
+                .unsqueeze(1)  # (B,1,L,D/2)
+            )
+            sin = (
+                self.sin_cached.index_select(0, flat)
+                .reshape(B, L, -1)
+                .to(dtype=q.dtype)
+                .unsqueeze(1)  # (B,1,L,D/2)
+            )
+
+        q = self._apply_rotary(q, cos, sin)
+        k = self._apply_rotary(k, cos, sin)
+        return q, k
 
 
 class MultiHeadAttention(nn.Module):
     """
-    Multi-head self-attention module.
-    
-    This is a standard scaled dot-product attention implementation
-    with causal masking for autoregressive generation.
+    Multi-head self-attention using SDPA, with correct padding masking.
+
+    - If attention_mask is provided, we build a boolean "keep mask" that combines:
+        * causal mask (lower triangular)
+        * key padding mask
+      and call SDPA with is_causal=False (mask already contains causal).
+    - If attention_mask is None, we call SDPA with is_causal=True (fast path).
     """
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__()
-        
-        assert config.n_embd % config.n_head == 0, \
+
+        assert config.n_embd % config.n_head == 0, (
             f"n_embd ({config.n_embd}) must be divisible by n_head ({config.n_head})"
-        
+        )
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        
-        # Combined QKV projection for efficiency
+
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        
-        self.dropout = nn.Dropout(config.dropout)
-        
-        # Causal mask (will be created on first forward pass)
+
+        self.attn_dropout_p = float(config.dropout)
+
+        self.use_rope = bool(getattr(config, "use_rope", False))
+        if self.use_rope:
+            if self.head_dim % 2 != 0:
+                raise ValueError(f"RoPE requires even head_dim, got {self.head_dim}")
+            self.rope = RotaryEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=config.n_ctx,
+                base=float(getattr(config, "rope_theta", 10000.0)),
+            )
+        else:
+            self.rope = None
+
+        # Causal keep-mask buffer: True means "allowed"
         self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.n_ctx, config.n_ctx)).view(
+            "causal_keep",
+            torch.tril(torch.ones(config.n_ctx, config.n_ctx, dtype=torch.bool)).view(
                 1, 1, config.n_ctx, config.n_ctx
             ),
             persistent=False,
         )
-    
+
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        batch_size, seq_len, _ = x.size()
-        
-        # Compute Q, K, V
+        B, L, _ = x.size()
+
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        
-        # Reshape for multi-head attention
-        q = q.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        
-        # Scaled dot-product attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        # Apply causal mask
-        causal_mask = self.bias[:, :, :seq_len, :seq_len]
-        attn_weights = attn_weights.masked_fill(causal_mask == 0, float("-inf"))
-        
-        # Apply attention mask (for padding)
-        if attention_mask is not None:
-            # attention_mask shape: (batch_size, seq_len) -> (batch_size, 1, 1, seq_len)
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
-        
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)
-        
-        # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous().view(
-            batch_size, seq_len, self.n_embd
-        )
-        
-        # Output projection
-        attn_output = self.c_proj(attn_output)
-        
-        return attn_output
+
+        q = q.reshape(B, L, self.n_head, self.head_dim).transpose(1, 2)  # (B,H,L,D)
+        k = k.reshape(B, L, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, L, self.n_head, self.head_dim).transpose(1, 2)
+
+        if self.use_rope:
+            q, k = self.rope(q, k, position_ids=position_ids)
+
+        dropout_p = self.attn_dropout_p if self.training else 0.0
+
+        # Correct masking (equivalent to the old code):
+        # - Old code: causal mask + key padding mask applied to attention scores.
+        # - Here: build a boolean keep-mask (True=keep, False=masked) for SDPA.
+        if attention_mask is None:
+            attn_mask = None
+            is_causal = True
+        else:
+            # key_keep: (B,1,1,L) True for real tokens, False for pads
+            key_keep = attention_mask[:, None, None, :].to(dtype=torch.bool)
+            # causal_keep: (1,1,L,L)
+            causal_keep = self.causal_keep[:, :, :L, :L]
+            # combined: (B,1,L,L) via broadcast
+            attn_mask = causal_keep & key_keep
+            is_causal = False  # mask already contains causal
+
+        attn_output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )  # (B,H,L,D)
+
+        attn_output = attn_output.transpose(1, 2).reshape(B, L, self.n_embd)
+        return self.c_proj(attn_output)
+
 
 
 class FeedForward(nn.Module):
     """
     Feed-forward network (MLP) module.
-    
+
     Standard two-layer MLP with GELU activation.
     """
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__()
-        
+
         self.c_fc = nn.Linear(config.n_embd, config.n_inner)
         self.c_proj = nn.Linear(config.n_inner, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.gelu(x)
@@ -190,27 +362,26 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """
     A single transformer block with attention and feed-forward layers.
-    
+
     Uses pre-normalization (LayerNorm before attention/FFN) for better
     training stability.
     """
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__()
-        
-        self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+
+        self.ln_1 = RMSNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.attn = MultiHeadAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+        self.ln_2 = RMSNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.mlp = FeedForward(config)
-    
+
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Pre-norm attention
-        x = x + self.attn(self.ln_1(x), attention_mask=attention_mask)
-        # Pre-norm FFN
+        x = x + self.attn(self.ln_1(x), attention_mask=attention_mask, position_ids=position_ids)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -218,60 +389,47 @@ class TransformerBlock(nn.Module):
 class ChessForCausalLM(PreTrainedModel):
     """
     Chess Transformer for Causal Language Modeling (next-move prediction).
-    
-    This model is designed to predict the next chess move given a sequence
-    of previous moves. It uses a GPT-style architecture with:
-    - Token embeddings for chess moves
-    - Learned positional embeddings
-    - Stacked transformer blocks
-    - Linear head for next-token prediction
-    
-    The model supports weight tying between the embedding layer and the
-    output projection to save parameters.
-    
-    Example:
-        >>> config = ChessConfig(vocab_size=1200, n_embd=128, n_layer=6)
-        >>> model = ChessForCausalLM(config)
-        >>> inputs = {"input_ids": torch.tensor([[1, 42, 87]])}
-        >>> outputs = model(**inputs)
-        >>> next_move_logits = outputs.logits[:, -1, :]
+
+    RoPE:
+      - If config.use_rope=True (default), no learned positional embeddings are used.
+      - RoPE is applied inside attention on Q and K.
+
+    One-hot embeddings:
+      - If config.one_hot_embeds=True, input embeddings are computed as:
+          one_hot(input_ids) @ wte.weight
+        This is heavier than nn.Embedding lookup, but matches the requested behavior.
     """
-    
+
     config_class = ChessConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
-    # Suppress missing-key warning for tied lm_head when loading
     keys_to_ignore_on_load_missing = ["lm_head.weight"]
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__(config)
-        
-        # Token and position embeddings
-        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.wpe = nn.Embedding(config.n_ctx, config.n_embd)
-        
+
+        if config.one_hot_embeds:
+            self.wte = OneHotEmbedding(config.vocab_size)
+        else:
+            self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+
+        # Positional embeddings only if not using RoPE
+        self.wpe = None if getattr(config, "use_rope", False) else nn.Embedding(config.n_ctx, config.n_embd)
+
         self.drop = nn.Dropout(config.dropout)
-        
-        # Transformer blocks
-        self.h = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.n_layer)
-        ])
-        
-        # Final layer norm
-        self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        
-        # Output head
+
+        self.h = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)])
+
+        self.ln_f = RMSNorm(config.n_embd, eps=config.layer_norm_epsilon)
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # Declare tied weights for proper serialization
+
         if config.tie_weights:
             self._tied_weights_keys = ["lm_head.weight"]
-        
-        # Initialize weights
+
         self.post_init()
-        
-        # Tie weights if configured
-        if config.tie_weights:
+
+        if config.tie_weights and (not config.one_hot_embeds):
             self.tie_weights()
 
     def get_input_embeddings(self) -> nn.Module:
@@ -289,10 +447,12 @@ class ChessForCausalLM(PreTrainedModel):
         self.lm_head = new_embeddings
 
     def tie_weights(self):
-        # Use HF helper to tie or clone depending on config
+        if getattr(self.config, "one_hot_embeds", False):
+            return
         if getattr(self.config, "tie_weights", False) or getattr(self.config, "tie_word_embeddings", False):
             self._tie_or_clone_weights(self.lm_head, self.wte)
-    
+
+
     def _init_weights(self, module: nn.Module):
         """Initialize weights following GPT-2 style."""
         if isinstance(module, nn.Linear):
@@ -301,10 +461,9 @@ class ChessForCausalLM(PreTrainedModel):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
-            torch.nn.init.zeros_(module.bias)
-    
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -314,61 +473,63 @@ class ChessForCausalLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        """
-        Forward pass of the model.
-        
-        Args:
-            input_ids: Token IDs of shape (batch_size, seq_len).
-            attention_mask: Attention mask of shape (batch_size, seq_len).
-            position_ids: Position IDs of shape (batch_size, seq_len).
-            labels: Labels for language modeling loss.
-            return_dict: Whether to return a ModelOutput object.
-        
-        Returns:
-            CausalLMOutputWithPast containing loss (if labels provided) and logits.
-        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        batch_size, seq_len = input_ids.size()
+
+        B, L = input_ids.size()
         device = input_ids.device
-        
-        # Create position IDs if not provided
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        # Get embeddings
-        token_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = self.drop(token_embeds + position_embeds)
-        
-        # Pass through transformer blocks
+
+        use_rope = bool(getattr(self.config, "use_rope", False))
+        one_hot_embeds = bool(getattr(self.config, "one_hot_embeds", False))
+
+        # Only build position_ids when needed for learned absolute positions.
+        # For RoPE, position_ids can be None (fast path), unless caller provides custom position_ids.
+        if (position_ids is None) and (not use_rope):
+            position_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+
+        # Token embeddings
+        if one_hot_embeds:
+            token_embeds = self.wte(input_ids)
+            hidden_states = token_embeds
+        else:
+            token_embeds = self.wte(input_ids)
+
+        hidden_states = token_embeds
+
+        # Absolute learned positions only if RoPE disabled
+        if not use_rope:
+            if self.wpe is None:
+                raise RuntimeError("wpe is None but use_rope is False (inconsistent init).")
+            pos_embeds = self.wpe(position_ids)
+            hidden_states = hidden_states + pos_embeds
+
+        # Optional: zero out padded positions early (cheap)
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(-1).to(dtype=hidden_states.dtype)
+
+        hidden_states = self.drop(hidden_states)
+
         for block in self.h:
-            hidden_states = block(hidden_states, attention_mask=attention_mask)
-        
-        # Final layer norm
+            hidden_states = block(hidden_states, attention_mask=attention_mask, position_ids=position_ids)
+
         hidden_states = self.ln_f(hidden_states)
-        
-        # Get logits
+
         logits = self.lm_head(hidden_states)
-        
-        # Compute loss if labels are provided
+
         loss = None
         if labels is not None:
-            # Shift logits and labels for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
-            # Flatten for cross-entropy
+
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
-        
+
         if not return_dict:
             output = (logits,)
             return ((loss,) + output) if loss is not None else output
-        
+
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -376,7 +537,7 @@ class ChessForCausalLM(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
-    
+
     @torch.no_grad()
     def generate_move(
         self,
@@ -385,48 +546,30 @@ class ChessForCausalLM(PreTrainedModel):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> int:
-        """
-        Generate the next move given a sequence of moves.
-        
-        Args:
-            input_ids: Token IDs of shape (1, seq_len).
-            temperature: Sampling temperature (1.0 = no change).
-            top_k: If set, only sample from top k tokens.
-            top_p: If set, use nucleus sampling with this threshold.
-        
-        Returns:
-            The token ID of the predicted next move.
-        """
         self.eval()
-        
-        # Get logits for the last position
+
         outputs = self(input_ids)
         logits = outputs.logits[:, -1, :] / temperature
-        
-        # Apply top-k filtering
+
         if top_k is not None:
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
             logits[indices_to_remove] = float("-inf")
-        
-        # Apply top-p (nucleus) filtering
+
         if top_p is not None:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Remove tokens with cumulative probability above the threshold
+
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
-            
+
             indices_to_remove = sorted_indices_to_remove.scatter(
                 dim=-1, index=sorted_indices, src=sorted_indices_to_remove
             )
             logits[indices_to_remove] = float("-inf")
-        
-        # Sample from the distribution
+
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
-        
         return next_token.item()
 
 

@@ -44,11 +44,11 @@ def parse_args():
         help="Number of transformer layers"
     )
     parser.add_argument(
-        "--n_head", type=int, default=4,
+        "--n_head", type=int, default=5,
         help="Number of attention heads"
     )
     parser.add_argument(
-        "--n_ctx", type=int, default=256,
+        "--n_ctx", type=int, default=1024,
         help="Maximum context length"
     )
     parser.add_argument(
@@ -125,6 +125,14 @@ def parse_args():
         "--save_steps", type=int, default=1000,
         help="Checkpoint saving frequency"
     )
+    parser.add_argument(
+        "--no_rope", action="store_true", 
+        help="Disable RoPE and use learned absolute positional embeddings"
+    )
+    parser.add_argument(
+        "--one_hot_embeds", action="store_true", 
+        help="Use one-hot embeddings (one_hot @ W) instead of nn.Embedding lookup"
+    )
     
     return parser.parse_args()
 
@@ -142,18 +150,25 @@ def main():
     
     # Build tokenizer from dataset
     print("\nBuilding tokenizer from dataset...")
-    tokenizer = ChessTokenizer.build_vocab_from_dataset(
-        dataset_name=args.dataset_name,
-        min_frequency=500,  # Only keep moves that appear at least 500 times
-        max_samples=100000,  # Use 100k games to build vocabulary
-    )
+    tokenizer = ChessTokenizer()
     print(f"   Vocabulary size: {tokenizer.vocab_size}")
     
     # Use the vocab size from tokenizer (override args if provided)
     actual_vocab_size = tokenizer.vocab_size
     
+    if args.one_hot_embeds:
+        # True one-hot implies d_model = vocab_size
+        args.n_embd = actual_vocab_size
+
+        # Make sure n_head works
+        if args.n_embd % args.n_head != 0:
+            raise ValueError(
+                f"With --one_hot_embeds, n_embd=vocab_size={args.n_embd} must be divisible by n_head={args.n_head}."
+            )
+
     # Create model configuration
     print("\nCreating model configuration...")
+    tie_ok = (not args.no_tie_weights) and (not args.one_hot_embeds)
     config = ChessConfig(
         vocab_size=actual_vocab_size,
         n_embd=args.n_embd,
@@ -162,7 +177,9 @@ def main():
         n_ctx=args.n_ctx,
         n_inner=args.n_inner,
         dropout=args.dropout,
-        tie_weights=not args.no_tie_weights,
+        tie_weights=tie_ok,
+        use_rope=not args.no_rope,
+        one_hot_embeds=args.one_hot_embeds,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -224,6 +241,7 @@ def main():
 
     # avant torch compile : 45it/s
     # après : 77 it/s
+    # avec sdpa : 82 it/s (noRope)
     
     # Create trainer
     trainer = Trainer(
